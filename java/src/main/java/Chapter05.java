@@ -4,6 +4,7 @@ import org.apache.commons.csv.CSVParser;
 import org.javatuples.Pair;
 import redis.clients.jedis.*;
 
+import java.io.Console;
 import java.io.File;
 import java.io.FileReader;
 import java.text.Collator;
@@ -36,17 +37,18 @@ public class Chapter05 {
     public void run()
         throws InterruptedException
     {
-        Jedis conn = new Jedis("localhost");
+        Jedis conn = new Jedis("localhost", 6379);
+        conn.auth("kuranado.com");
         conn.select(15);
 
-        testLogRecent(conn);
-        testLogCommon(conn);
-        testCounters(conn);
-        testStats(conn);
-        testAccessTime(conn);
+        //testLogRecent(conn);
+        //testLogCommon(conn);
+        //testCounters(conn);
+        //testStats(conn);
+        //testAccessTime(conn);
         testIpLookup(conn);
-        testIsUnderMaintenance(conn);
-        testConfig(conn);
+        //testIsUnderMaintenance(conn);
+        //testConfig(conn);
     }
 
     public void testLogRecent(Jedis conn) {
@@ -90,6 +92,7 @@ public class Chapter05 {
         System.out.println("Let's update some counters for now and a little in the future");
         long now = System.currentTimeMillis() / 1000;
         for (int i = 0; i < 10; i++) {
+            // 1 <= count <= 5
             int count = (int)(Math.random() * 5) + 1;
             updateCounter(conn, "test", count, now + i);
         }
@@ -219,6 +222,7 @@ public class Chapter05 {
         System.out.println("\n----- testConfig -----");
         System.out.println("Let's set a config and then get a connection from that config...");
         Map<String,Object> config = new HashMap<String,Object>();
+        config.put("auth", "kuranado.com");
         config.put("db", 15);
         setConfig(conn, "redis", "test", config);
 
@@ -418,7 +422,8 @@ public class Chapter05 {
     public Jedis redisConnection(String component){
         Jedis configConn = REDIS_CONNECTIONS.get("config");
         if (configConn == null){
-            configConn = new Jedis("localhost");
+            configConn = new Jedis("localhost", 6379);
+            configConn.auth("kuranado.com");
             configConn.select(15);
             REDIS_CONNECTIONS.put("config", configConn);
         }
@@ -428,7 +433,10 @@ public class Chapter05 {
         Map<String,Object> config = getConfig(configConn, "redis", component);
 
         if (!config.equals(oldConfig)){
-            Jedis conn = new Jedis("localhost");
+            Jedis conn = new Jedis("localhost", 6379);
+            if (config.containsKey("auth")) {
+                conn.auth(config.get("auth").toString());
+            }
             if (config.containsKey("db")){
                 conn.select(((Double)config.get("db")).intValue());
             }
@@ -450,7 +458,11 @@ public class Chapter05 {
                 if (startIp.toLowerCase().indexOf('i') != -1){
                     continue;
                 }
-                int score = 0;
+                int score;
+                // 去除子网掩码
+                if (startIp.contains("/")) {
+                    startIp = startIp.substring(0, startIp.indexOf("/"));
+                }
                 if (startIp.indexOf('.') != -1){
                     score = ipToScore(startIp);
                 }else{
@@ -460,7 +472,8 @@ public class Chapter05 {
                         continue;
                     }
                 }
-
+                // 因为多个 IP 可能对应同一 cityId，直接将 cityId 作为 zset value 添加将会有部分 value 添加失败
+                // cityId + 唯一编号作为新的 cityId，以保证 zset 中的 value 值（新 cityId）唯一
                 String cityId = line[2] + '_' + count;
                 conn.zadd("ip2cityid:", score, cityId);
                 count++;
@@ -507,6 +520,7 @@ public class Chapter05 {
 
     public int ipToScore(String ipAddress) {
         int score = 0;
+        // 为 IP 地址计算一个唯一的分数
         for (String v : ipAddress.split("\\.")){
             score = score * 256 + Integer.parseInt(v, 10);
         }
@@ -538,7 +552,8 @@ public class Chapter05 {
         private long timeOffset; // used to mimic a time in the future.
 
         public CleanCountersThread(int sampleCount, long timeOffset){
-            this.conn = new Jedis("localhost");
+            this.conn = new Jedis("localhost", 6379);
+            this.conn.auth("kuranado.com");
             this.conn.select(15);
             this.sampleCount = sampleCount;
             this.timeOffset = timeOffset;
@@ -548,7 +563,9 @@ public class Chapter05 {
             quit = true;
         }
 
+        @Override
         public void run(){
+            // 记录清理操作执行的次数
             int passes = 0;
             while (!quit){
                 long start = System.currentTimeMillis() + timeOffset;
@@ -560,6 +577,7 @@ public class Chapter05 {
                         break;
                     }
                     String hash = hashSet.iterator().next();
+                    // 获取计数器精度
                     int prec = Integer.parseInt(hash.substring(0, hash.indexOf(':')));
                     int bprec = (int)Math.floor(prec / 60);
                     if (bprec == 0){
@@ -570,10 +588,12 @@ public class Chapter05 {
                     }
 
                     String hkey = "count:" + hash;
+                    // 根据给定的精度和需要保留的样本数量，计算出需要保留什么时间以前的样本
                     String cutoff = String.valueOf(
                         ((System.currentTimeMillis() + timeOffset) / 1000) - sampleCount * prec);
                     ArrayList<String> samples = new ArrayList<String>(conn.hkeys(hkey));
                     Collections.sort(samples);
+                    // 需要移除的样本数
                     int remove = bisectRight(samples, cutoff);
 
                     if (remove != 0){
@@ -592,10 +612,13 @@ public class Chapter05 {
                     }
                 }
 
+                // 完成一次清理，清理次数 + 1
                 passes++;
+                // 清理所花费的时间，如果超过 1 min，则 duration = 1 min；如果不超过 1 min，则 duration = 实际花费时间
                 long duration = Math.min(
                     (System.currentTimeMillis() + timeOffset) - start + 1000, 60000);
                 try {
+                    // 如果清理所花费的时间不超过 1 min，则休眠 60 - 花费时间；如果清理花费的时间超过 1 min，则休眠 1 s
                     sleep(Math.max(60000 - duration, 1000));
                 }catch(InterruptedException ie){
                     Thread.currentThread().interrupt();
